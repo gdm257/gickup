@@ -1,16 +1,16 @@
 {
   "feature_name": "webdav-destination",
   "created_at": "2026-01-31T00:00:00Z",
-  "updated_at": "2026-01-31T00:00:01Z",
+  "updated_at": "2026-01-31T12:00:00Z",
   "language": "en",
-  "phase": "requirements-generated",
+  "phase": "design-generated",
   "approvals": {
     "requirements": {
       "generated": true,
-      "approved": false
+      "approved": true
     },
     "design": {
-      "generated": false,
+      "generated": true,
       "approved": false
     },
     "tasks": {
