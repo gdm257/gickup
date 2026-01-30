@@ -79,8 +79,7 @@ graph TB
 | Layer | Choice / Version | Role in Feature | Notes |
 |-------|------------------|-----------------|-------|
 | HTTP Client | `net/http` (standard library) | WebDAV communication | No external library needed |
-| TLS | `crypto/tls` (standard library) | Client certificate support | PEM/PKCS12 file handling |
-| Authentication | Custom implementation | Basic, Digest, Cert auth | HTTP headers with base64 encoding |
+| Authentication | Custom implementation | Basic, Digest auth | HTTP headers with base64 encoding |
 | Configuration | `types/types.go` extension | YAML config structure | Follows S3Repo/AzureBlob pattern |
 | Logging | `zerolog` (existing) | Structured logging | Sub-logger with webdav stage |
 | Metrics | `prometheus/client_golang` (existing) | Backup metrics | New label value "webdav" |
@@ -91,12 +90,16 @@ graph TB
 
 | Requirement | Summary | Components | Interfaces | Flows |
 |-------------|---------|------------|------------|-------|
-| 1 | WebDAV destination configuration | WebDAVConfig, Main | YAML struct tag | Config loading |
-| 2 | Connection and authentication | HTTPClient, WebDAVPackage | Auth interfaces | Connection verification |
-| 3 | Repository push to WebDAV | WebDAVPackage | UploadDirToWebDAV | Upload flow |
-| 4 | WebDAV feature compatibility | HTTPClient, WebDAVPackage | Headers, redirects | Feature handling |
-| 5 | Error handling and logging | WebDAVPackage, Metrics | Retry logic, zerolog | Error flow |
-| 6 | Configuration validation | WebDAVConfig | URL validation | Startup validation |
+| 1.1, 1.2, 1.5 | WebDAV destination configuration | WebDAVConfig, Main | YAML struct tag | Config loading |
+| 2.1, 2.2, 2.5 | Connection verification and Basic Auth | HTTPClient, WebDAVPackage | Auth interfaces | Connection verification |
+| 2.3, 2.4 | Digest and Cert authentication | HTTPClient | Auth implementation | Handshake flow |
+| 3.1, 3.2 | Repository push (MKCOL, PUT) | WebDAVPackage | UploadDirToWebDAV | Upload flow |
+| 3.3, 3.4, 3.5 | Upload verification and retry | WebDAVPackage | Retry logic | Error recovery |
+| 4.1, 4.2, 4.3 | Feature compatibility (chunked, keep-alive, redirects) | HTTPClient, WebDAVPackage | Headers, redirects | Feature handling |
+| 4.4, 4.5 | WebDAV headers and fallback behavior | HTTPClient | Header management | Feature handling |
+| 5.1, 5.2, 5.3 | Error logging and retry logging | WebDAVPackage, Metrics | Retry logic, zerolog | Error flow |
+| 5.4, 5.5 | Structured logging and failure handling | WebDAVPackage | Metrics | Failure handling |
+| 6.1, 6.2, 6.4 | Configuration validation | WebDAVConfig | URL validation | Startup validation |
 
 ---
 
@@ -106,10 +109,10 @@ graph TB
 
 | Component | Domain/Layer | Intent | Req Coverage | Key Dependencies | Contracts |
 |-----------|--------------|--------|--------------|------------------|-----------|
-| WebDAV | Configuration | Define WebDAV destination config | 1, 6 | types (P0) | Struct |
-| WebDAVClient | HTTP Client | Manage server connections | 2, 4 | net/http, crypto/tls (P0) | Service |
-| UploadDirToWebDAV | Upload Logic | Upload directory contents | 3, 4 | WebDAVClient (P0), Local (P1) | Service |
-| DeleteObjectsNotInRepo | Cleanup Logic | Remove orphaned files | 3 | WebDAVClient (P0) | Service |
+| WebDAV | Configuration | Define WebDAV destination config | 1.1, 1.2, 1.5, 6.1, 6.2, 6.4 | types (P0) | Struct |
+| WebDAVClient | HTTP Client | Manage server connections | 2.1, 2.2, 2.3, 2.4, 4.1, 4.2, 4.3, 4.5 | net/http, crypto/tls (P0) | Service |
+| UploadDirToWebDAV | Upload Logic | Upload directory contents | 3.1, 3.2, 3.3, 3.4, 3.5, 4.4 | WebDAVClient (P0), Local (P1) | Service |
+| DeleteObjectsNotInRepo | Cleanup Logic | Remove orphaned files | 3.4 | WebDAVClient (P0) | Service |
 
 ---
 
@@ -139,9 +142,7 @@ type WebDAV struct {
     URL           string `yaml:"url"`
     Username      string `yaml:"username"`
     Password      string `yaml:"password"`
-    CertFile      string `yaml:"certfile"`
-    CertPassword  string `yaml:"certpassword"`
-    PathPrefix    string `yaml:"pathprefix"`
+    Path          string `yaml:"path"`
     Structured    bool   `yaml:"structured"`
     Zip           bool   `yaml:"zip"`
     DateCreateDir bool   `yaml:"datecreatedir"`
@@ -149,8 +150,7 @@ type WebDAV struct {
 ```
 
 **Implementation Notes**:
-- CertFile supports PEM and PKCS12 formats
-- PathPrefix defaults to empty string (root of WebDAV server)
+- Path defaults to empty string (root of WebDAV server)
 - Structured and DateCreateDir match S3Repo/AzureBlob semantics
 
 ---
@@ -205,6 +205,57 @@ type DavResponse struct {
 | PROPFIND | /{path} | XML body | 207 Multi-Status | 401, 403, 404 |
 | DELETE | /{path} | Empty | 204 No Content | 401, 403, 404 |
 
+##### PROPFIND XML Parsing Strategy
+
+PROPFIND responses use XML with DAV namespace. Response structure:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/path/to/resource</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getlastmodified>Sun, 01 Jan 2023 00:00:00 GMT</d:getlastmodified>
+        <d:getcontentlength>12345</d:getcontentlength>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+```
+
+**Parsing Approach**:
+- Use `encoding/xml` with struct-based unmarshaling
+- Define minimal struct for response extraction:
+
+```go
+type DavResponse struct {
+    Responses []struct {
+        Href string `xml:"href"`
+        PropStat []struct {
+            Prop struct {
+                GetLastModified string `xml:"getlastmodified"`
+                GetContentLength int64 `xml:"getcontentlength"`
+            } `xml:"prop"`
+            Status string `xml:"status"`
+        } `xml:"propstat"`
+    } `xml:"response"`
+}
+```
+
+- Filter by Status code 200 OK to get valid resources
+- Extract Href paths for comparison with local files
+
+**Error Handling**:
+- Malformed XML → wrap with context and return
+- Missing DAV namespace → log warning, attempt basic parsing
+- Empty response → return empty list (no resources)
+
+**Implementation Notes**:
+- Depth header controls response: Depth:0 (single resource), Depth:1 (collection + children)
+- For cleanup: use Depth:1 to list all resources in directory
+
 **Implementation Notes**:
 - Digest auth requires initial 401 challenge response to extract nonce
 - Client certificate loaded via tls.LoadX509KeyPair or tls.X509KeyPair
@@ -220,7 +271,7 @@ type DavResponse struct {
 | Field | Detail |
 |-------|--------|
 | Intent | Upload directory contents to WebDAV server with proper structure |
-| Requirements | 3.1, 3.2, 3.3, 3.4, 3.5, 4.1, 4.2, 4.4, 5.1, 5.2, 5.3, 5.5 |
+| Requirements | 3.1, 3.2, 3.3, 3.4, 3.5, 4.4, 5.1, 5.2, 5.3, 5.5 |
 
 **Responsibilities & Constraints**:
 - Walk local directory tree (similar to S3/AzureBlob patterns)
@@ -267,7 +318,7 @@ func UploadDirToWebDAV(
 | Field | Detail |
 |-------|--------|
 | Intent | Remove files from WebDAV server that no longer exist locally |
-| Requirements | 3.4 |
+| Requirements | 3.4, 5.4 |
 
 **Responsibilities & Constraints**:
 - List remote resources via PROPFIND
@@ -277,7 +328,7 @@ func UploadDirToWebDAV(
 
 **Dependencies**:
 - Inbound: types.Repo (P0) - repository name for path resolution
-- Inbound: types.WebDAV (P0) - path prefix configuration
+- Inbound: types.WebDAV (P0) - path configuration
 - Outbound: WebDAVClient (P0) - PROPFIND and DELETE operations
 
 **Contracts**: Service [x] / API [ ] / Event [ ] / Batch [ ] / State [ ]
@@ -310,9 +361,8 @@ func DeleteObjectsNotInRepo(
 WebDAV Destination
 ├── URL: WebDAV server base URL
 ├── Credentials (optional)
-│   ├── Username/Password (Basic/Digest)
-│   └── CertFile/CertPassword (TLS Client)
-├── PathPrefix: Remote path prefix
+│   └── Username/Password (Basic/Digest)
+├── Path: Remote path prefix
 └── Options
     ├── Structured: Include hoster/owner in path
     ├── Zip: Compress before upload
@@ -327,19 +377,19 @@ type WebDAV struct {
     URL           string  // Required: WebDAV server URL (http/https)
     Username      string  // Optional: for Basic/Digest auth
     Password      string  // Optional: resolves from env vars
-    CertFile      string  // Optional: client certificate path
-    CertPassword  string  // Optional: certificate passphrase
-    PathPrefix    string  // Optional: remote path prefix
+    Path          string  // Optional: remote path prefix
     Structured    bool    // Default: false
     Zip           bool    // Default: false
     DateCreateDir bool    // Default: false
 }
 ```
+}
+```
 
 **Consistency & Integrity**:
 - URL validated at startup (must start with http:// or https://)
-- Credentials validated: if Username set, Password required (unless CertFile)
-- PathPrefix normalized: trimmed slashes, converted to WebDAV format
+- Credentials validated: if Username set, Password required
+- Path normalized: trimmed slashes, converted to WebDAV format
 
 ---
 
@@ -422,7 +472,6 @@ sub.Warn().Msg("server does not support required WebDAV feature")
 
 - **Credential Handling**: Passwords resolved from environment variables (like S3 accesskey/secretkey)
 - **TLS Verification**: Server certificates validated by default; option to skip for self-signed
-- **Client Certificates**: Loaded from encrypted PEM/PKCS12 files
 - **No Credential Logging**: Passwords never logged; use placeholder in debug output
 - **HTTPS Enforcement**: Recommend https:// for production use
 

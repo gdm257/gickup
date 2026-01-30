@@ -32,7 +32,8 @@ WebDAV destination for Gickup enables pushing Git repository backups to WebDAV s
 |--------|---------------|----------|
 | Basic Auth | `Authorization: Basic <base64>` | Username/password authentication |
 | Digest Auth | HTTP 401 challenge-response | Non-cleartext password transmission |
-| Client Certificate | TLS mutual authentication | Enterprise environments |
+
+Client certificate authentication removed from scope.
 
 ### WebDAV Feature Compatibility
 
@@ -106,10 +107,13 @@ Add new label value `"webdav"` to:
 ## Key Design Decisions
 
 1. **No External WebDAV Library**: Use standard net/http with custom WebDAV method handling
-2. **Client Certificate Support**: Load PEM/PKCS12 files via crypto/tls package
+2. **Authentication**: Basic Auth and Digest Auth supported; no client certificate
 3. **Path Handling**: Use filepath-based paths locally, convert to WebDAV paths (forward slashes) for remote
 4. **Retry Strategy**: Exponential backoff (1s, 2s, 4s) with max 3 attempts for transient failures
 5. **Structured Logging**: Use zerolog sub-logger with webdav stage identifier
+6. **XML Parsing**: Use `encoding/xml` with struct-based unmarshaling for PROPFIND responses
+   - Minimal struct definition to extract href and status fields
+   - No external XML library needed; standard library sufficient for DAV responses
 
 ## Discovery Log
 
